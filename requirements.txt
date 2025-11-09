@@ -1,8 +1,4 @@
 streamlit
-opencv-python
+opencv-python-headless
 numpy
-sqlite3
-cv2
-tempfile
-os
-base64
+pillow
