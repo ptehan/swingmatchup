@@ -573,7 +573,7 @@ elif menu == "Create Matchup":
 # ---------- LIBRARY ----------
 elif menu == "Library":
     st.header("Library")
-    tabs = st.tabs(["Matchups", Pitch Clips", "Swing Clips"])
+    tabs = st.tabs(["Matchups", "Pitch Clips", "Swing Clips"])
 
     # Pitch
     with tabs[0]:
