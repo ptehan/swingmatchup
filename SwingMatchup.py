@@ -4,6 +4,9 @@ import cv2
 import numpy as np
 import tempfile
 import os
+import base64
+
+
 from datetime import datetime
 
 # ---------- SETUP ----------
@@ -116,13 +119,50 @@ st.title("⚾ Swing Matchup")
 import streamlit as st
 
 # --- Simple password gate ---
-password = st.text_input("Enter password", type="password")
-if password != st.secrets.get("app_password", "changeme"):
+if "authenticated" not in st.session_state:
+    st.session_state.authenticated = False
+
+if not st.session_state.authenticated:
+    password = st.text_input("Enter password", type="password")
+    if password == st.secrets.get("app_password", "changeme"):
+        st.session_state.authenticated = True
+        st.rerun()
+    else:
+        if password:
+            st.error("❌ Incorrect password")
     st.stop()
 
-menu = st.sidebar.selectbox("Menu", [
-    "Create Matchup", "Library", "Upload Pitch", "Upload Swing", "Pitchers", "Hitters", "Teams"
-])
+
+# --- Clean Plain-Text Sidebar Menu ---
+st.sidebar.markdown("### Menu")
+
+options = [
+    "Library",
+    "Create Matchup",
+    "Upload Pitch",
+    "Upload Swing",
+    "Pitchers",
+    "Hitters",
+    "Teams"
+]
+
+# Draw visible text links
+for opt in options:
+    if opt == st.session_state.get("menu", "Library"):
+        st.sidebar.markdown(f"**{opt}**")  # bold current page
+    else:
+        st.sidebar.markdown(f"[{opt}](?menu={opt.replace(' ', '%20')})", unsafe_allow_html=True)
+
+# --- Handle selection manually ---
+query_params = st.query_params  # ✅ FIXED — no parentheses
+if "menu" in query_params:
+    chosen = query_params["menu"][0].replace("%20", " ")
+    if chosen in options:
+        st.session_state["menu"] = chosen
+
+menu = st.session_state.get("menu", "Library")
+
+
 
 # ---------- TEAMS ----------
 if menu == "Teams":
@@ -575,138 +615,171 @@ elif menu == "Library":
     st.header("Library")
     tabs = st.tabs(["Matchups", "Pitch Clips", "Swing Clips"])
 
-    # Pitch
+    # ---------- MATCHUPS ----------
     with tabs[0]:
+        rows = cur.execute("""
+            SELECT id, description, created_at, pitch_clip_id, swing_clip_id
+            FROM matchups ORDER BY id DESC
+        """).fetchall()
+        if not rows:
+            st.info("No matchups found.")
+        else:
+            for row in rows:
+                matchup_id, desc, created, pitch_id, swing_id = row
+                with st.expander(f"Matchup {matchup_id}: {desc or '(no description)'} — {created}", expanded=False):
+                    # --- Info ---
+                    pitch_info = cur.execute("""
+                        SELECT t.name, p.name FROM pitch_clips pc
+                        JOIN pitchers p ON pc.pitcher_id=p.id
+                        JOIN teams t ON pc.team_id=t.id
+                        WHERE pc.id=?
+                    """, (pitch_id,)).fetchone()
+
+                    swing_info = cur.execute("""
+                        SELECT t.name, h.name FROM swing_clips sc
+                        JOIN hitters h ON sc.hitter_id=h.id
+                        JOIN teams t ON sc.team_id=t.id
+                        WHERE sc.id=?
+                    """, (swing_id,)).fetchone()
+
+                    if pitch_info and swing_info:
+                        st.markdown(
+                            f"**Pitcher:** {pitch_info[1]} ({pitch_info[0]})  \n"
+                            f"**Hitter:** {swing_info[1]} ({swing_info[0]})"
+                        )
+                    st.markdown(f"**Description:** {desc or '(none)'}")
+
+                    # --- CONTROL ROW: TRUE ONE-LINE LAYOUT ---
+                    # Fetch blobs
+                    matchup_blob = cur.execute(
+                        "SELECT matchup_blob FROM matchups WHERE id=?", (matchup_id,)
+                    ).fetchone()[0]
+                    pitch_blob, fps_p = cur.execute(
+                        "SELECT clip_blob, fps FROM pitch_clips WHERE id=?", (pitch_id,)
+                    ).fetchone()
+                    swing_blob, fps_s, decision_frame = cur.execute(
+                        "SELECT clip_blob, fps, decision_frame FROM swing_clips WHERE id=?", (swing_id,)
+                    ).fetchone()
+
+                    # Extract frames
+                    ptmp = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
+                    ptmp.write(pitch_blob)
+                    ptmp.close()
+                    cap_p = cv2.VideoCapture(ptmp.name)
+                    total_pitch_frames = int(cap_p.get(cv2.CAP_PROP_FRAME_COUNT))
+
+                    tmp_s = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
+                    tmp_s.write(swing_blob)
+                    tmp_s.close()
+                    cap_s = cv2.VideoCapture(tmp_s.name)
+                    total_swing_frames = int(cap_s.get(cv2.CAP_PROP_FRAME_COUNT))
+                    cap_s.release()
+                    os.unlink(tmp_s.name)
+
+                    pad_frames = max(0, total_pitch_frames - total_swing_frames)
+                    decision_global = pad_frames + int(decision_frame or 0)
+
+                    # Capture start + decision frames
+                    cap_p.set(cv2.CAP_PROP_POS_FRAMES, pad_frames)
+                    ret_start, frame_start = cap_p.read()
+                    cap_p.set(cv2.CAP_PROP_POS_FRAMES, decision_global)
+                    ret_decision, frame_decision = cap_p.read()
+                    cap_p.release()
+                    os.unlink(ptmp.name)
+
+                    start_bytes = decision_bytes = None
+                    if ret_start:
+                        _, buf = cv2.imencode(".jpg", frame_start)
+                        start_bytes = buf.tobytes()
+                    if ret_decision:
+                        _, buf = cv2.imencode(".jpg", frame_decision)
+                        decision_bytes = buf.tobytes()
+
+                    # Build HTML layout
+                    html = """
+                    <style>
+                        .button-bar {
+                            display: flex;
+                            flex-wrap: nowrap;
+                            gap: 0.6rem;
+                            margin-top: 10px;
+                        }
+                        .button-bar form {margin: 0;}
+                        .stDownloadButton>button, .stButton>button {
+                            white-space: nowrap;
+                        }
+                    </style>
+                    <div class="button-bar">
+                    """
+                    st.markdown(html, unsafe_allow_html=True)
+
+                    # Four buttons, inline
+                    colA, colB, colC, colD = st.columns([1.3, 1, 1, 0.8])
+
+                    with colA:
+                        st.download_button(
+                            "⬇️ Download Video",
+                            matchup_blob,
+                            file_name=f"matchup_{matchup_id}.mp4",
+                            mime="video/mp4",
+                            key=f"dl_vid_{matchup_id}"
+                        )
+
+                    with colB:
+                        if start_bytes:
+                            st.download_button(
+                                "⬇️ Start Frame",
+                                start_bytes,
+                                file_name=f"pitch_start_{matchup_id}.jpg",
+                                mime="image/jpeg",
+                                key=f"dl_start_{matchup_id}"
+                            )
+                        else:
+                            st.warning("⚠️")
+
+                    with colC:
+                        if decision_bytes:
+                            st.download_button(
+                                "⬇️ Decision Frame",
+                                decision_bytes,
+                                file_name=f"pitch_decision_{matchup_id}.jpg",
+                                mime="image/jpeg",
+                                key=f"dl_decision_{matchup_id}"
+                            )
+                        else:
+                            st.warning("⚠️")
+
+                    with colD:
+                        if st.button("🗑️ Delete", key=f"del_matchup_{matchup_id}"):
+                            delete_record("matchups", matchup_id)
+                            st.rerun()
+
+    # ---------- PITCH CLIPS ----------
+    with tabs[1]:
         rows = cur.execute("SELECT id, description, created_at FROM pitch_clips ORDER BY id DESC").fetchall()
         if not rows:
             st.info("No pitch clips found.")
-        for row in rows:
-            clip_id, desc, created = row
-            st.write(f"**Pitch {clip_id}** — {desc or ''} ({created})")
-            blob = cur.execute("SELECT clip_blob FROM pitch_clips WHERE id=?", (clip_id,)).fetchone()[0]
-            col1, col2 = st.columns(2)
-            col1.download_button(f"Download Pitch {clip_id}", blob, f"pitch_{clip_id}.mp4", "video/mp4")
-            if col2.button(f"Delete Pitch {clip_id}", key=f"del_pitch_{clip_id}"):
-                delete_record("pitch_clips", clip_id); st.rerun()
+        else:
+            for clip_id, desc, created in rows:
+                with st.expander(f"Pitch {clip_id}: {desc or '(no description)'} — {created}", expanded=False):
+                    blob = cur.execute("SELECT clip_blob FROM pitch_clips WHERE id=?", (clip_id,)).fetchone()[0]
+                    col1, col2 = st.columns([2,1])
+                    col1.download_button("Download Pitch Clip", blob, f"pitch_{clip_id}.mp4", "video/mp4")
+                    if col2.button("Delete", key=f"del_pitch_{clip_id}"):
+                        delete_record("pitch_clips", clip_id)
+                        st.rerun()
 
-    # Swing
-    with tabs[1]:
+    # ---------- SWING CLIPS ----------
+    with tabs[2]:
         rows = cur.execute("SELECT id, description, created_at FROM swing_clips ORDER BY id DESC").fetchall()
         if not rows:
             st.info("No swing clips found.")
-        for row in rows:
-            clip_id, desc, created = row
-            st.write(f"**Swing {clip_id}** — {desc or ''} ({created})")
-            blob = cur.execute("SELECT clip_blob FROM swing_clips WHERE id=?", (clip_id,)).fetchone()[0]
-            col1, col2 = st.columns(2)
-            col1.download_button(f"Download Swing {clip_id}", blob, f"swing_{clip_id}.mp4", "video/mp4")
-            if col2.button(f"Delete Swing {clip_id}", key=f"del_swing_{clip_id}"):
-                delete_record("swing_clips", clip_id); st.rerun()
-
-    # Matchups
-    # Matchups
-    with tabs[2]:
-        rows = cur.execute("SELECT id, description, created_at, pitch_clip_id, swing_clip_id FROM matchups ORDER BY id DESC").fetchall()
-        if not rows:
-            st.info("No matchups found.")
-        for row in rows:
-            matchup_id, desc, created, pitch_id, swing_id = row
-            st.write(f"**Matchup {matchup_id}** — {desc or ''} ({created})")
-
-            blob = cur.execute("SELECT matchup_blob FROM matchups WHERE id=?", (matchup_id,)).fetchone()[0]
-            col1, col2, col3 = st.columns([1, 1, 2])
-
-            col1.download_button(f"Download Matchup {matchup_id}", blob, f"matchup_{matchup_id}.mp4", "video/mp4")
-
-            # --- Download pitcher frame at swing start ---
-            if col2.button(f"Download Swing-Start Frame", key=f"frame_{matchup_id}"):
-
-                # Get pitch/swing clips to calculate pad
-                pitch_blob, fps_p = cur.execute("SELECT clip_blob, fps FROM pitch_clips WHERE id=?", (pitch_id,)).fetchone()
-                swing_blob, fps_s = cur.execute("SELECT clip_blob, fps FROM swing_clips WHERE id=?", (swing_id,)).fetchone()
-                ptmp = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
-                ptmp.write(pitch_blob); ptmp.close()
-
-                cap_p = cv2.VideoCapture(ptmp.name)
-                frames_p = int(cap_p.get(cv2.CAP_PROP_FRAME_COUNT))
-                stmp = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
-                stmp.write(swing_blob)
-                stmp.close()
-
-                cap_s = cv2.VideoCapture(stmp.name)
-                frames_s = int(cap_s.get(cv2.CAP_PROP_FRAME_COUNT))
-                cap_s.release()
-                os.unlink(stmp.name)
-
-                pad_frames = max(0, frames_p - frames_s)
-
-                # Seek to swing-start frame in pitcher video
-                cap_p.set(cv2.CAP_PROP_POS_FRAMES, pad_frames)
-                ret, frame = cap_p.read()
-                if ret:
-                    jpg_path = f"pitch_frame_{matchup_id}.jpg"
-                    cv2.imwrite(jpg_path, frame)
-                    with open(jpg_path, "rb") as f:
-                        col2.download_button("Download Frame", f, jpg_path, "image/jpeg", key=f"dl_img_{matchup_id}")
-                    os.remove(jpg_path)
-                else:
-                    st.warning(f"⚠️ Could not extract frame for matchup {matchup_id}")
-
-                cap_p.release()
-                os.unlink(ptmp.name)
-
-
-            # --- Download pitcher frame at swing decision ---
-            if col2.button(f"Download Swing-Decision Frame", key=f"frame_decision_{matchup_id}"):
-                # Get pitch/swing clips and decision info
-                pitch_blob, fps_p = cur.execute("SELECT clip_blob, fps FROM pitch_clips WHERE id=?", (pitch_id,)).fetchone()
-                swing_blob, fps_s, decision_frame = cur.execute(
-                    "SELECT clip_blob, fps, decision_frame FROM swing_clips WHERE id=?", (swing_id,)
-                ).fetchone()
-
-                # Write pitch clip to temp file
-                ptmp = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
-                ptmp.write(pitch_blob)
-                ptmp.close()
-
-                # Open pitch and swing to get frame counts
-                cap_p = cv2.VideoCapture(ptmp.name)
-                total_pitch_frames = int(cap_p.get(cv2.CAP_PROP_FRAME_COUNT))
-                tmp_s = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
-                tmp_s.write(swing_blob)
-                tmp_s.close()
-                cap_s = cv2.VideoCapture(tmp_s.name)
-                total_swing_frames = int(cap_s.get(cv2.CAP_PROP_FRAME_COUNT))
-                cap_s.release()
-                os.unlink(tmp_s.name)
-
-                # Figure out how many frames pad before swing starts
-                pad_frames = max(0, total_pitch_frames - total_swing_frames)
-                decision_global = pad_frames + int(decision_frame or 0)
-
-                # Seek to that frame in the pitch video
-                cap_p.set(cv2.CAP_PROP_POS_FRAMES, decision_global)
-                ret, frame = cap_p.read()
-                if ret:
-                    jpg_path = f"pitch_decision_{matchup_id}.jpg"
-                    cv2.imwrite(jpg_path, frame)
-                    with open(jpg_path, "rb") as f:
-                        col2.download_button(
-                            "Download Decision Frame",
-                            f,
-                            file_name=jpg_path,
-                            mime="image/jpeg",
-                            key=f"dl_decision_{matchup_id}",
-                        )
-                    os.remove(jpg_path)
-                else:
-                    st.warning(f"⚠️ Could not extract decision frame for matchup {matchup_id}")
-
-                cap_p.release()
-                os.unlink(ptmp.name)
-
-
-            if col3.button(f"Delete Matchup {matchup_id}", key=f"del_matchup_{matchup_id}"):
-                delete_record("matchups", matchup_id)
-                st.rerun()
-
+        else:
+            for clip_id, desc, created in rows:
+                with st.expander(f"Swing {clip_id}: {desc or '(no description)'} — {created}", expanded=False):
+                    blob = cur.execute("SELECT clip_blob FROM swing_clips WHERE id=?", (clip_id,)).fetchone()[0]
+                    col1, col2 = st.columns([2,1])
+                    col1.download_button("Download Swing Clip", blob, f"swing_{clip_id}.mp4", "video/mp4")
+                    if col2.button("Delete", key=f"del_swing_{clip_id}"):
+                        delete_record("swing_clips", clip_id)
+                        st.rerun()
